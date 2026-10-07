@@ -25,7 +25,7 @@ from pypdf import PdfReader
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps prompts small and fast
 MIN_RESUME_CHARS = 150  # below this we assume the PDF is scanned / empty
