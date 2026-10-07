@@ -13,11 +13,13 @@ UI: Streamlit    |    AI: Google Gemini Flash (via the google-genai SDK)
 
 import io
 import os
+import time
 from typing import List, Optional
 
 import streamlit as st
 from docx import Document
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field
 from pypdf import PdfReader
@@ -29,6 +31,9 @@ DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 MAX_FILE_MB = 5
 MAX_RESUME_CHARS = 20_000  # keeps prompts small and fast
 MIN_RESUME_CHARS = 150  # below this we assume the PDF is scanned / empty
+FALLBACK_MODELS = ("gemini-3.5-flash", "gemini-3.5-flash-lite")  # tried in order if the main model stays overloaded
+MAX_ATTEMPTS = 3  # attempts per model for temporary (5xx / overloaded) errors
+RETRY_DELAY_SECONDS = 2  # doubles after each failed attempt
 
 SYSTEM_INSTRUCTION = """You are an expert technical recruiter and ATS (Applicant Tracking System) specialist.
 You evaluate resumes the way modern ATS software and recruiters do: keyword match,
@@ -163,6 +168,41 @@ def normalise(result: ResumeAnalysis) -> ResumeAnalysis:
     return result
 
 
+def _is_transient(exc: Exception) -> bool:
+    """True for temporary server-side problems worth retrying (500/502/503/504)."""
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    low = str(exc).lower()
+    return any(k in low for k in ("503", "overloaded", "unavailable"))
+
+
+def _make_config(model: str) -> types.GenerateContentConfig:
+    """Google recommends leaving temperature at its default for Gemini 3.x models."""
+    kwargs = {}
+    if not model.startswith("gemini-3"):
+        kwargs["temperature"] = 0.3  # steadier scores on 2.x models
+    return types.GenerateContentConfig(
+        system_instruction=SYSTEM_INSTRUCTION,
+        response_mime_type="application/json",
+        response_schema=ResumeAnalysis,
+        **kwargs,
+    )
+
+
+def _generate_with_retry(client, model: str, prompt: str, config):
+    last_exc: Optional[Exception] = None
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            return client.models.generate_content(model=model, contents=prompt, config=config)
+        except Exception as exc:
+            if not _is_transient(exc):
+                raise  # bad key, quota, bad model name... retrying won't help
+            last_exc = exc
+            if attempt < MAX_ATTEMPTS - 1:
+                time.sleep(RETRY_DELAY_SECONDS * (2 ** attempt))
+    raise last_exc  # type: ignore[misc]
+
+
 def analyze_resume(
     api_key: str,
     resume_text: str,
@@ -171,16 +211,18 @@ def analyze_resume(
     client: Optional[genai.Client] = None,
 ) -> ResumeAnalysis:
     client = client or genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=build_prompt(resume_text, job_description),
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            response_mime_type="application/json",
-            response_schema=ResumeAnalysis,
-            temperature=0.3,
-        ),
-    )
+    prompt = build_prompt(resume_text, job_description)
+    # Try the chosen model first; if it stays overloaded, fall back to older/lighter ones.
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    response = None
+    for i, m in enumerate(models):
+        try:
+            response = _generate_with_retry(client, m, prompt, _make_config(m))
+            break
+        except Exception as exc:
+            if i == len(models) - 1 or not _is_transient(exc):
+                raise
+
     parsed = getattr(response, "parsed", None)
     if isinstance(parsed, ResumeAnalysis):
         return normalise(parsed)
